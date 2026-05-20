@@ -1,57 +1,21 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
-const axios = require('axios');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
 const fs = require('fs');
+const axios = require('axios');
+const ytdl = require('ytdl-core');
 const path = require('path');
 
-// Folder untuk download sementara
 const DOWNLOAD_DIR = './downloads';
 if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR);
 
-// Konfigurasi client dengan LocalAuth (session tersimpan)
-const client = new Client({
-    authStrategy: new LocalAuth({
-        clientId: 'ranz-bot',
-        dataPath: './sessions'
-    }),
-    puppeteer: {
-        headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
-    }
-});
+let sock;
 
-// Event: QR Code
-client.on('qr', (qr) => {
-    console.log('📱 SCAN QR CODE INI DENGAN WHATSAPP:');
-    qrcode.generate(qr, { small: true });
-    console.log('\n📲 Cara: WhatsApp → 3 titik → Perangkat Tertaut → Tautkan Perangkat → Scan QR\n');
-});
-
-// Event: Client siap
-client.on('ready', () => {
-    console.log('✅ BOT RANZ AKTIF!');
-    console.log('📌 Perintah yang tersedia:');
-    console.log('   stiker        - Buat stiker dari gambar');
-    console.log('   yt [link]     - Download YouTube');
-    console.log('   ig [link]     - Download Instagram');
-    console.log('   tt [link]     - Download TikTok');
-    console.log('   menu / help   - Tampilkan menu');
-});
-
-// ============ FUNGSI DOWNLOAD ============
-
-// Download YouTube (pake ytdl-core)
 async function downloadYouTube(url) {
-    const ytdl = require('ytdl-core');
     return new Promise((resolve, reject) => {
         const timestamp = Date.now();
         const outputPath = path.join(DOWNLOAD_DIR, `yt_${timestamp}.mp4`);
         
-        const stream = ytdl(url, { 
-            quality: 'highestvideo',
-            filter: 'audioandvideo'
-        });
-        
+        const stream = ytdl(url, { quality: 'highestvideo' });
         const writeStream = fs.createWriteStream(outputPath);
         stream.pipe(writeStream);
         
@@ -61,7 +25,6 @@ async function downloadYouTube(url) {
     });
 }
 
-// Download dari API pihak ketiga (TikTok, Instagram)
 async function downloadFromAPI(url, platform) {
     try {
         const apiUrl = `https://api.savetube.me/save?url=${encodeURIComponent(url)}`;
@@ -71,6 +34,176 @@ async function downloadFromAPI(url, platform) {
             const videoUrl = response.data.videoUrl;
             const timestamp = Date.now();
             const outputPath = path.join(DOWNLOAD_DIR, `${platform}_${timestamp}.mp4`);
+            
+            const videoResponse = await axios({
+                method: 'get',
+                url: videoUrl,
+                responseType: 'stream'
+            });
+            
+            const writer = fs.createWriteStream(outputPath);
+            videoResponse.data.pipe(writer);
+            
+            return new Promise((resolve, reject) => {
+                writer.on('finish', () => resolve(outputPath));
+                writer.on('error', reject);
+            });
+        }
+        return null;
+    } catch (error) {
+        console.error(`Error API:`, error.message);
+        return null;
+    }
+}
+
+async function connectToWhatsApp() {
+    const { state, saveCreds } = await useMultiFileAuthState('./sessions');
+    
+    sock = makeWASocket({
+        auth: state,
+        printQRInTerminal: true,
+        browser: ['Ubuntu', 'Chrome', '20.0.04']
+    });
+
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+        
+        if (qr) {
+            console.log('\n📱 SCAN QR CODE INI DENGAN WHATSAPP:');
+            console.log(qr);
+            console.log('\n📲 Cara: WhatsApp → 3 titik → Perangkat Tertaut → Tautkan Perangkat → Scan QR\n');
+        }
+        
+        if (connection === 'open') {
+            console.log('\n✅ BOT RANZ AKTIF!');
+            console.log('📌 Perintah:\n');
+            console.log('   stiker        - Buat stiker dari gambar');
+            console.log('   yt [link]     - Download YouTube');
+            console.log('   ig [link]     - Download Instagram');
+            console.log('   tt [link]     - Download TikTok');
+            console.log('   menu / help   - Tampilkan menu\n');
+        }
+        
+        if (connection === 'close') {
+            const shouldReconnect = (lastDisconnect.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
+            console.log('Koneksi terputus, reconnect...');
+            if (shouldReconnect) {
+                connectToWhatsApp();
+            }
+        }
+    });
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+        const msg = messages[0];
+        if (!msg.message || msg.key.fromMe) return;
+        
+        const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
+        const from = msg.key.remoteJid;
+        
+        console.log(`📩 Pesan: ${text}`);
+        
+        // Menu
+        if (text.toLowerCase() === 'menu' || text.toLowerCase() === 'help') {
+            await sock.sendMessage(from, { text: `╔══════════════════════════════════╗
+║        🤖 RANZ BOT WhatsApp 🤖        ║
+╠══════════════════════════════════════╣
+║ stiker     - bikin stiker             ║
+║ yt [link]  - download YouTube         ║
+║ ig [link]  - download Instagram       ║
+║ tt [link]  - download TikTok          ║
+╚══════════════════════════════════════╝` });
+            return;
+        }
+        
+        // Stiker
+        if (text.toLowerCase() === 'stiker' || text.toLowerCase() === 'sticker') {
+            const media = msg.message.imageMessage || msg.message.videoMessage;
+            if (!media) {
+                await sock.sendMessage(from, { text: '❌ Kirim gambar/video lalu ketik "stiker"' });
+                return;
+            }
+            
+            try {
+                await sock.sendMessage(from, { text: '🔄 Membuat stiker...' });
+                const buffer = await sock.downloadMediaMessage(msg);
+                await sock.sendMessage(from, { sticker: buffer });
+            } catch (error) {
+                await sock.sendMessage(from, { text: '❌ Gagal membuat stiker' });
+            }
+            return;
+        }
+        
+        // YouTube
+        if (text.toLowerCase().startsWith('yt ')) {
+            const url = text.substring(3).trim();
+            if (!url.includes('youtube.com') && !url.includes('youtu.be')) {
+                await sock.sendMessage(from, { text: '❌ Link bukan YouTube!' });
+                return;
+            }
+            
+            await sock.sendMessage(from, { text: '🔄 Download YouTube...' });
+            try {
+                const filePath = await downloadYouTube(url);
+                await sock.sendMessage(from, { video: { url: filePath }, caption: '✅ Video YouTube siap!' });
+                fs.unlinkSync(filePath);
+            } catch (error) {
+                await sock.sendMessage(from, { text: '❌ Gagal download YouTube' });
+            }
+            return;
+        }
+        
+        // Instagram
+        if (text.toLowerCase().startsWith('ig ')) {
+            const url = text.substring(3).trim();
+            if (!url.includes('instagram.com')) {
+                await sock.sendMessage(from, { text: '❌ Link bukan Instagram!' });
+                return;
+            }
+            
+            await sock.sendMessage(from, { text: '🔄 Download Instagram...' });
+            try {
+                const filePath = await downloadFromAPI(url, 'ig');
+                if (filePath) {
+                    await sock.sendMessage(from, { video: { url: filePath }, caption: '✅ Video Instagram siap!' });
+                    fs.unlinkSync(filePath);
+                } else {
+                    await sock.sendMessage(from, { text: '❌ Gagal download Instagram' });
+                }
+            } catch (error) {
+                await sock.sendMessage(from, { text: '❌ Gagal download Instagram' });
+            }
+            return;
+        }
+        
+        // TikTok
+        if (text.toLowerCase().startsWith('tt ')) {
+            const url = text.substring(3).trim();
+            if (!url.includes('tiktok.com')) {
+                await sock.sendMessage(from, { text: '❌ Link bukan TikTok!' });
+                return;
+            }
+            
+            await sock.sendMessage(from, { text: '🔄 Download TikTok...' });
+            try {
+                const filePath = await downloadFromAPI(url, 'tt');
+                if (filePath) {
+                    await sock.sendMessage(from, { video: { url: filePath }, caption: '✅ Video TikTok siap!' });
+                    fs.unlinkSync(filePath);
+                } else {
+                    await sock.sendMessage(from, { text: '❌ Gagal download TikTok' });
+                }
+            } catch (error) {
+                await sock.sendMessage(from, { text: '❌ Gagal download TikTok' });
+            }
+            return;
+        }
+    });
+}
+
+console.log('🚀 Menjalankan RANZ Bot...');
+connectToWhatsApp();            const outputPath = path.join(DOWNLOAD_DIR, `${platform}_${timestamp}.mp4`);
             
             const videoResponse = await axios({
                 method: 'get',
