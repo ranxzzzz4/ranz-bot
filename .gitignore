@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+
+# Session & Auth
+sessions/
+auth_info.json
+session.json
+*.session
+*.session-*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Downloads
+downloads/
+*.mp4
+*.mp3
+*.webm
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Railway / Deploy
+.railway/
+.vercel/
